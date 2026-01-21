@@ -147,6 +147,16 @@ def snapshot_state(Parameters, State, t):
   }
 
 def sim_step(Parameters, State, rng, t, rows):
+  """
+  Simulation Loop event ordering is as follows:
+  1. First, the defender chooses an action (PASSIVE, ACTIVE, or RECOVER) to play for the current timestep
+  2. The attacker than chooses whether or not it will attack and at what intensity
+  3. We resolve the attack phase and determine if there is any damage to the defenders IT or OT layers
+  4. Defender Detection/Containment procedures attempt to detect damage and if detected, mitigate damage
+  5. OT damage accumulates if ot_comp remains
+  6. downtime of defender infrastructure (represented by ot_layer) updates
+  7. If in RECOVER, an additional step may clear compromise and reduce damage missed by the detection/containment step
+  """
   pre = snapshot_state(Parameters, State, t)
 
   #Placeholder policy: always PASSIVE for now (1/6/26)
@@ -164,6 +174,10 @@ def sim_step(Parameters, State, rng, t, rows):
   #Defender detection and containment step
   dc = detection_and_containment_step(Parameters, State, rng, B)
 
+  #compromise status after detection/containment, but before recovery
+  it_comp_post_dc = int(State['it_comp'])
+  ot_comp_post_dc = int(State['ot_comp'])
+
   #damage step
   damage_step = ot_physical_damage_step(Parameters, State, intensity, B)
 
@@ -172,6 +186,10 @@ def sim_step(Parameters, State, rng, t, rows):
 
   #recovery action step (if recovery action is chosen)
   recovery = recovery_resolution_step(Parameters, State, rng, B, action)
+
+  #compromise state after recovery step
+  it_comp_end = int(State['it_comp'])
+  ot_comp_end = int(State['ot_comp'])
 
   #Log row for simulation data collection
   row = dict(pre)
@@ -197,10 +215,13 @@ def sim_step(Parameters, State, rng, t, rows):
      "p_success": float(p_success),
      "attack_success": int(attack_success),
 
-     #system compromised status flags for next timestep (determined after attack resolution step)
-     #cast as int (1 = compromised, 0 = not compromised)
-     "it_comp_next": int(State['it_comp']),
-     "ot_comp_next": int(State['ot_comp']),
+      # compromise status after detect/containment (pre-recovery)
+     "it_comp_post_dc": it_comp_post_dc,
+     "ot_comp_post_dc": ot_comp_post_dc,
+
+     # compromise status at end of timestep (post-recovery)
+     "it_comp_end": it_comp_end,
+     "ot_comp_end": ot_comp_end,
 
      #Next state values
      'it_vuln_next' : float(State['it_vuln']),
@@ -432,7 +453,7 @@ def downtime_update_step(Parameters, State, B, action):
   3. RECOVER reduces downtime via boosts which are applied in this function
   """
 
-  comp_present = 1 if int(State['it_comp'] == 1 or State['ot_comp'] == 1) else 0
+  comp_present = 1 if (int(State['it_comp']) == 1 or int(State['ot_comp'] == 1)) else 0
 
   dt_counter = 0.0
   dt_counter += float(Parameters['downtime_comp_cost'] * comp_present)
@@ -474,8 +495,8 @@ def recovery_resolution_step(Parameters, State, rng, B, action):
     State['ot_comp'] = 0
     out['recover_ot_cleared'] = 1
 
-  #modest damage reduction option under RECOVER action (optional)
-  frac = clip01(float)(Parameters.get('damage_recover_decay', 0.0))
+  #logic for implementing an optional modest damage reduction under the RECOVER action
+  frac = clip01(float(Parameters.get('damage_recover_decay', 0.0)))
   if frac > 0:
     before = float(State['phys_damage'])
     after = max(0.0, before * (1.0 - frac))
@@ -498,7 +519,7 @@ test3[['t', 'id_cap', 'attack_name', 'intensity_name', 'p_high']].head(100)
 
 #Test of attack resolution functionality implemented on (1/16/26)
 test4 = run_sim(Parameters, State.copy(), np.random.default_rng(int(Parameters["Seed"])))
-test4[['t', 'attack_name', 'intensity_name', 'p_success', 'attack_success', 'it_comp_next', 'ot_comp_next']].head(30)
+test4[['t', 'attack_name', 'intensity_name', 'p_success', 'attack_success', 'it_comp_end', 'ot_comp_end']].head(30)
 
 #test attack resolution outputs
 test5 = run_sim(Parameters, State.copy(), np.random.default_rng(int(Parameters["Seed"])))
@@ -506,7 +527,7 @@ test5 = test5[['it_comp', 'it_detected', 'it_contained', 'it_comp_post', 'ot_com
 
 #test attack damage and recovery outputs
 test6 = run_sim(Parameters, State.copy(), np.random.default_rng(int(Parameters['Seed'])))
-test6 = test6[['t', 'attack_name', 'ot_comp_next', 'damage_step', 'phys_damage_next', 'downtime_total', 'downtime_next']].head(50)
+test6 = test6[['t', 'attack_name', 'ot_comp_end', 'damage_step', 'phys_damage_next', 'downtime_total', 'downtime_next']].head(50)
 
 test6
 
