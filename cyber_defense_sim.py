@@ -160,7 +160,7 @@ def sim_step(Parameters, State, rng, t, rows):
   pre = snapshot_state(Parameters, State, t)
 
   #Placeholder policy: always PASSIVE for now (1/6/26)
-  action = Action.PASSIVE
+  action = choose_action(Parameters, State, rng, t)
 
   #Defender action effects
   B = apply_defender_action(Parameters, State, action)
@@ -505,6 +505,77 @@ def recovery_resolution_step(Parameters, State, rng, B, action):
 
   return out
 
+#defender action decision logic
+
+"""
+This is the logic the defender will initially use to make decisions about which policy decisions to adopt at any given timestep.
+These are currently hard-coded based on my best guesses at a somewhat coherent defensive strategy, however this is mainly a placeholder for the implementation of
+some kind of RL algorithm which will be inplemnted later to help optimize defensive strategy decision making.
+"""
+
+#First, we need to define thresholds for defender decisions regarding which action to take in a timestep
+policy_defaults = {
+    'defender_policy': 'threshold_v1',  # options currently implemented: 'always_passive', 'threshold_v1', 'random'
+    'id_cap_min_threshold': 0.30,      # if id_cap is below this, favor ACTIVE
+    'phys_damage_threshold': 0.50,     # if damage is above this, favor RECOVER
+    'downtime_high_threshold': 1.00    # if downtime is above this, favor RECOVER
+}
+
+# just a lil logic to ensure the policy default values are added to the Parameter list
+for k, v in policy_defaults.items():
+  if k not in Parameters.index:
+    Parameters[k] = v
+
+#Now we can implement the logic for the defender to actually choose an action
+
+def choose_action(Parameters, State, rng, t):
+  """
+  Function that uses defender policy to determine which action the defender will choose each time step. There are currently three policies we can have the defender implement:
+  1. always_passive: the current baseline/placeholder policy in which the defender just plays PASSIVE no matter what
+  2. random: a policy in which the defender uses a uniform, random dist. to pick the three actions (PASSIVE, ACTIVE, RECOVER) at each time step.
+  3. threshold_v1: policy which uses a simple heuristic to determine action selection based on parameter thresholds.
+  """
+
+  policy = Parameters.get('defender_policy', 'always_passive')
+
+  if policy == 'always_passive':
+    return Action.PASSIVE
+
+  if policy == 'random':
+    return Action(int(rng.integers(0, 3))) #if 0: Aaction.PASSIVE, if 1: Action.ACTIVE, if 2: Action.RECOVER
+
+  if policy == 'threshold_v1':
+    it_comp = int(State['it_comp'])
+    ot_comp = int(State['ot_comp'])
+    id_cap = float(State['id_cap'])
+    phys_damage = float(State['phys_damage'])
+    downtime = float(State['downtime'])
+
+    id_low = float(Parameters.get('id_cap_low_threshold', 0.30))
+    dmg_high = float(Parameters.get("phys_damage_high_threshold", 0.50))
+    dt_high = float(Parameters.get('downtime_high_threshold', 1.00))
+
+    #Priority 1: if OT is compromised from previous timestep attacks, RECOVER
+    if ot_comp == 1:
+      return Action.RECOVER
+
+    # Priority 2, if infrastructure has high physical damage or experiences significant downtime, RECOVER
+    if phys_damage >= dmg_high or downtime >= dt_high:
+      return Action.RECOVER
+
+    #Priority 3: if IT layer is compromised, implement ACTIVE response action
+    if it_comp == 1:
+      return Action.ACTIVE
+
+    #Priority 4: If ability to identify attacker is low, use ACTIVE action to improve capabilities
+    if id_cap < id_low:
+      return Action.ACTIVE
+
+    # Otherwise, invest in long-term defensive assets
+    return Action.PASSIVE
+
+  raise ValueError(f"Unknown defender_policy: {policy}")
+
 #Debugging test to make sure Dataframe is produced as intended
 df_test = run_sim(Parameters, State.copy(), rng)
 df_test.head(10)
@@ -528,6 +599,14 @@ test5 = test5[['it_comp', 'it_detected', 'it_contained', 'it_comp_post', 'ot_com
 #test attack damage and recovery outputs
 test6 = run_sim(Parameters, State.copy(), np.random.default_rng(int(Parameters['Seed'])))
 test6 = test6[['t', 'attack_name', 'ot_comp_end', 'damage_step', 'phys_damage_next', 'downtime_total', 'downtime_next']].head(50)
+
+#test defender action choice logic implementation, threshold_v1
+Parameters['defender_policy'] = 'threshold_v1'
+State['id_cap'] = 0.35
+test_policy1 = run_sim(Parameters, State.copy(), np.random.default_rng(int(Parameters['Seed'])))
+
+display(test_policy1[["t","action_name","attack_name","it_comp","ot_comp","it_comp_post_dc","ot_comp_post_dc","it_comp_end","ot_comp_end"]].head(50))
+print(test_policy1["action_name"].value_counts())
 
 test6
 
