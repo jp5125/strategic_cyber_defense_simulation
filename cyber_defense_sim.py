@@ -453,7 +453,7 @@ def downtime_update_step(Parameters, State, B, action):
   3. RECOVER reduces downtime via boosts which are applied in this function
   """
 
-  comp_present = 1 if (int(State['it_comp']) == 1 or int(State['ot_comp'] == 1)) else 0
+  comp_present = int(int(State['it_comp']) == 1 or int(State['ot_comp']) == 1)
 
   dt_counter = 0.0
   dt_counter += float(Parameters['downtime_comp_cost'] * comp_present)
@@ -489,11 +489,11 @@ def recovery_resolution_step(Parameters, State, rng, B, action):
 
   if int(State['it_comp']) == 1 and (rng.random() < p_clear):
     State['it_comp'] = 0
-    out['recover_it_cleared'] = 1
+    out['recovery_it_cleared'] = 1
 
   if int(State['ot_comp']) == 1 and (rng.random() < p_clear):
     State['ot_comp'] = 0
-    out['recover_ot_cleared'] = 1
+    out['recovery_ot_cleared'] = 1
 
   #logic for implementing an optional modest damage reduction under the RECOVER action
   frac = clip01(float(Parameters.get('damage_recover_decay', 0.0)))
@@ -551,8 +551,8 @@ def choose_action(Parameters, State, rng, t):
     phys_damage = float(State['phys_damage'])
     downtime = float(State['downtime'])
 
-    id_low = float(Parameters.get('id_cap_low_threshold', 0.30))
-    dmg_high = float(Parameters.get("phys_damage_high_threshold", 0.50))
+    id_low = float(Parameters.get('id_cap_min_threshold', 0.30))
+    dmg_high = float(Parameters.get("phys_damage_threshold", 0.50))
     dt_high = float(Parameters.get('downtime_high_threshold', 1.00))
 
     #Priority 1: if OT is compromised from previous timestep attacks, RECOVER
@@ -567,9 +567,9 @@ def choose_action(Parameters, State, rng, t):
     if it_comp == 1:
       return Action.ACTIVE
 
-    #Priority 4: If ability to identify attacker is low, use ACTIVE action to improve capabilities
+    #Priority 4: If ability to identify attacker is low, use PASSIVE action to improve capabilities
     if id_cap < id_low:
-      return Action.ACTIVE
+      return Action.PASSIVE
 
     # Otherwise, invest in long-term defensive assets
     return Action.PASSIVE
