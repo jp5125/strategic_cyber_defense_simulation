@@ -97,7 +97,7 @@ Parameters = pd.Series({
 
     #Recovery probabilities
     'p_recover_clear_base' : 0.10, #chance recovery clears compromise status
-    'damage_recover_delay' : 0.02 #fraction of damage removed under RECOVER action
+    'damage_recover_decay' : 0.02 #fraction of damage removed under RECOVER action
 })
 
 #Reproducible randomness
@@ -118,6 +118,7 @@ State = pd.Series({
     "ot_comp" : int(Parameters['ot_comp_init']),
     "downtime" : float(Parameters['downtime_init']),
     "phys_damage" : float(Parameters['phys_damage_init']),
+    "outage" : 0.0
     })
 
 #Simulation time + log storage data structures
@@ -144,7 +145,9 @@ def snapshot_state(Parameters, State, t):
       'ot_comp' : int(State['ot_comp']),
       'downtime' : float(State['downtime']),
       'phys_damage' : float(State['phys_damage']),
+      'outage' : float(State['outage'])
   }
+
 
 def sim_step(Parameters, State, rng, t, rows):
   """
@@ -156,8 +159,12 @@ def sim_step(Parameters, State, rng, t, rows):
   5. OT damage accumulates if ot_comp remains
   6. downtime of defender infrastructure (represented by ot_layer) updates
   7. If in RECOVER, an additional step may clear compromise and reduce damage missed by the detection/containment step
+  8. if policy = qlearn, run update_step method for q-learning
   """
   pre = snapshot_state(Parameters, State, t)
+
+  policy = Parameters.get('defender_policy', 'always_passive')
+  s_pre = discretize_state(Parameters, State) if policy == 'qlearn_v1' else None
 
   #Placeholder policy: always PASSIVE for now (1/6/26)
   action = choose_action(Parameters, State, rng, t)
@@ -182,7 +189,7 @@ def sim_step(Parameters, State, rng, t, rows):
   damage_step = ot_physical_damage_step(Parameters, State, intensity, B)
 
   #downtime
-  downtime_total = downtime_update_step(Parameters, State, B, action)
+  downtime_step = downtime_update_step(Parameters, State, B, action)
 
   #recovery action step (if recovery action is chosen)
   recovery = recovery_resolution_step(Parameters, State, rng, B, action)
@@ -190,6 +197,16 @@ def sim_step(Parameters, State, rng, t, rows):
   #compromise state after recovery step
   it_comp_end = int(State['it_comp'])
   ot_comp_end = int(State['ot_comp'])
+
+  #system outage state at end of timestep
+  outage_status = outage_update_step(Parameters, State)
+  outage_end = float(State['outage'])
+
+  #additional learning step for Qlearn policy
+  rl_reward = 0.0
+  if policy == 'qlearn_v1':
+    rl_reward = qlearn_update_step(Parameters, State, Q_AGENT, s_pre = s_pre, action = action, damage_step = damage_step, it_comp_end = it_comp_end, ot_comp_end = ot_comp_end)
+
 
   #Log row for simulation data collection
   row = dict(pre)
@@ -230,9 +247,14 @@ def sim_step(Parameters, State, rng, t, rows):
 
      #damage and recovery values
      'damage_step': float(damage_step),
-     'downtime_total': float(downtime_total),
      'phys_damage_next': float(State['phys_damage']),
-     'downtime_next': float(State['downtime'])
+     'downtime_step': float(downtime_step),
+     'downtime_next': float(State['downtime']),
+     'outage_status': outage_status,
+     'outage_next': outage_end,
+
+     #rl values
+     'rl_reward' : rl_reward
 
     })
 
@@ -424,12 +446,24 @@ def detection_and_containment_step(Parameters, State, rng, B):
 
 #This set of functions sets physical damage to the ot_layer from attacks and provides recovery resolution function for the defender
 
+
+outage_defaults = {
+    'outage_decay' : 0.60,
+    'outage_comp_cost' : 0.4,
+    'outage_damage_cost' : 0.2
+}
+
+for k,v in outage_defaults.items():
+  if k not in Parameters.index:
+    Parameters[k] = v
+
+
 def ot_physical_damage_step(Parameters, State, intensity, B):
   """If the OT layer is compromised, we add physical damage to the defender infrastructure
   1. start with base damage per step for low intensity atacks
   2. add multiplication factor for high intensity attacks
   3. reduce damage dealt based on the defenders' ACTIVE damage reduction boost
-  *** returns damage_step for logging
+  *** returns damage for logging
   """
 
   if int(State['ot_comp']) != 1:
@@ -470,6 +504,21 @@ def downtime_update_step(Parameters, State, B, action):
   State['downtime'] = float(dt)
   return float(dt_counter)
 
+def outage_update_step(Parameters, State):
+  comp_present = int(int(State['it_comp']) == 1 or int(State['ot_comp']) == 1)
+
+  out = 0.0
+  out += float(Parameters.get('outage_comp_cost', 0.40)) * float(comp_present)
+  out += float(Parameters.get('outage_damage_cost', 0.20)) * float(State['phys_damage'])
+
+  decay = float(Parameters.get('outage_decay', 0.60))
+  prev = float(State['outage'])
+
+  new_outage = (1.0 - decay) * prev + out
+  State['outage'] = float(clip01(new_outage))
+
+  return float(out)
+
 def recovery_resolution_step(Parameters, State, rng, B, action):
   """If RECOVER is the chosen action of the defender:
   1. probabilistically clear IT/OT compromise even if undetected
@@ -479,7 +528,7 @@ def recovery_resolution_step(Parameters, State, rng, B, action):
   out = {
       "recovery_it_cleared": 0,
       'recovery_ot_cleared': 0,
-      'damage_reduced': 0.0
+      'damage_reduction': 0.0
   }
 
   if action != Action.RECOVER:
@@ -515,10 +564,10 @@ some kind of RL algorithm which will be inplemnted later to help optimize defens
 
 #First, we need to define thresholds for defender decisions regarding which action to take in a timestep
 policy_defaults = {
-    'defender_policy': 'threshold_v1',  # options currently implemented: 'always_passive', 'threshold_v1', 'random'
-    'id_cap_min_threshold': 0.30,      # if id_cap is below this, favor ACTIVE
+    'defender_policy': 'threshold_v1',  # options currently implemented: 'always_passive', 'threshold_v1', 'random', 'qlearn_v1'
+    'id_cap_min_threshold': 0.30,      # if id_cap is below this, favor PASSIVE
     'phys_damage_threshold': 0.50,     # if damage is above this, favor RECOVER
-    'downtime_high_threshold': 1.00    # if downtime is above this, favor RECOVER
+    'outage_high_threshold': 0.60    # if downtime is above this, favor RECOVER
 }
 
 # just a lil logic to ensure the policy default values are added to the Parameter list
@@ -549,18 +598,18 @@ def choose_action(Parameters, State, rng, t):
     ot_comp = int(State['ot_comp'])
     id_cap = float(State['id_cap'])
     phys_damage = float(State['phys_damage'])
-    downtime = float(State['downtime'])
+    outage = float(State['outage'])
 
     id_low = float(Parameters.get('id_cap_min_threshold', 0.30))
     dmg_high = float(Parameters.get("phys_damage_threshold", 0.50))
-    dt_high = float(Parameters.get('downtime_high_threshold', 1.00))
+    outage_high = float(Parameters.get('outage_high_threshold', 0.60))
 
     #Priority 1: if OT is compromised from previous timestep attacks, RECOVER
     if ot_comp == 1:
       return Action.RECOVER
 
     # Priority 2, if infrastructure has high physical damage or experiences significant downtime, RECOVER
-    if phys_damage >= dmg_high or downtime >= dt_high:
+    if phys_damage >= dmg_high or outage >= outage_high:
       return Action.RECOVER
 
     #Priority 3: if IT layer is compromised, implement ACTIVE response action
@@ -574,7 +623,126 @@ def choose_action(Parameters, State, rng, t):
     # Otherwise, invest in long-term defensive assets
     return Action.PASSIVE
 
+  if policy == 'qlearn_v1':
+    s = discretize_state(Parameters, State)
+    action = Q_AGENT.select_action(s, float(Parameters['rl_epsilon']), rng)
+    return Action(action)
+
   raise ValueError(f"Unknown defender_policy: {policy}")
+
+"""
+Attempt to construct framework to allow for a temporal difference learning implemntation of a q-learning RL algorithm for our defender agent:
+This allows our defender agent to improve at choosing actions over time, rather than following one of our previously prescribed heuristic policies like
+'always_passive', 'random' or 'threshold_v1'
+"""
+
+rl_defaults = {
+    #hyperparameters for agent learning, adjustable during parameter sweeps
+    'rl_alpha': 0.15,
+    'rl_gamma': 0.95,
+    'rl_epsilon': 0.10,
+
+    #discretization values, this step allows for us to use the tabular q-learning technique with continuous data
+    'rl_id_cap_lo' : 0.33,
+    'rl_id_cap_high': 0.66,
+    'rl_damage_lo': 0.25,
+    'rl_damage_high': 0.75,
+    'rl_outage_lo': 0.25,
+    'rl_outage_high': 0.60,
+
+    #reward weights, specifically measured in an actions ability to minimize loss per/step per action (reward = -loss)
+    'rl_w_damage_step': 5.0,  # physical damage to infrastructure highly penalizes reward return
+    'rl_w_outage': 2.0,       # penalty for interruption to infrastructure services
+    'rl_w_ot_comp': 1.0,      # penalty for OT compromise
+    'rl_w_it_comp': 0.25,     # small IT compromise penalty, since this does not directly influence infrastructure only allows access for further damage
+}
+
+for k,v in rl_defaults.items():
+  if k not in Parameters.index:
+    Parameters[k] = v
+
+
+def rl_bin(x, lo, high):
+  """
+  Function that helps discretize state values based on discretization thresholds established in rl_defaults
+  0 = little to no damage/compromise to the defender systems
+  1 = signifcant damage/compromise to the defender systems
+  2 = catastrophic damage/compromise to the defender systems
+  """
+  if x < lo : return 0
+  if x < high: return 1
+  return 2
+
+def discretize_state(Parameters, State):
+  """
+  Discretized State Tuple:
+  (it_comp = 2, ot_comp = 2, id_cap_bin = 3, damage_bin = 3, outage_bin =3)
+  2 x 2 x 3 x 3 x 3 = 108 possible states in which our defender agent needs learn to make action decisions in
+  """
+
+  it_c = int(State['it_comp'])
+  ot_c = int(State['ot_comp'])
+
+  id_c_discrete = rl_bin(float(State['id_cap']), float(Parameters['rl_id_cap_lo']), float(Parameters['rl_id_cap_high']))
+  damage_discrete = rl_bin(float(State['phys_damage']), float(Parameters['rl_damage_lo']), float(Parameters['rl_damage_high']))
+  outage_discrete = rl_bin(float(State['outage']), float(Parameters['rl_outage_lo']), float(Parameters['rl_outage_high']))
+
+  return(it_c, ot_c, id_c_discrete, damage_discrete, outage_discrete)
+
+class QLearner:
+  """
+  Class blueprint for an agent who implements Qlearn policy
+  """
+  def __init__(self, n_actions = 3):
+    self.n_actions = n_actions
+    self.Q = {}
+
+  def row(self, s):
+    if s not in self.Q:
+      self.Q[s] = np.zeros(self.n_actions, dtype = float)
+    return self.Q[s]
+
+  def select_action(self, s, epsilon, rng):
+    if rng.random() < epsilon:
+      return int(rng.integers(0, self.n_actions))
+
+    q = self.row(s)
+    best_actions = np.flatnonzero(q == q.max())
+    return int(rng.choice(best_actions))
+
+  def update(self, s, a, r, s_next, alpha, gamma):
+    q = self.row(s)
+    q_next = self.row(s_next)
+    td_target = float(r) + float(gamma) * float(np.max(q_next))
+    q[a] = q[a] + float(alpha) * (td_target - q[a])
+
+
+Q_AGENT = QLearner(n_actions = 3)
+
+def reset_qlearner():
+  global Q_AGENT
+  Q_AGENT = QLearner(n_actions = 3)
+
+
+
+def rl_step_reward(Parameters, damage_step, outage_next, it_comp_end, ot_comp_end):
+  loss = 0.0
+  loss += float(Parameters['rl_w_damage_step']) * float(damage_step)
+  loss += float(Parameters['rl_w_outage']) * float(outage_next)
+  loss += float(Parameters['rl_w_it_comp']) * float(it_comp_end)
+  loss += float(Parameters['rl_w_ot_comp']) * float(ot_comp_end)
+
+  return -float(loss)
+
+def qlearn_update_step(Parameters, State, Q_AGENT, s_pre, action, damage_step, it_comp_end, ot_comp_end):
+  outage_next = float(State.get('outage', 0.0))
+  r = rl_step_reward(Parameters, damage_step, outage_next, it_comp_end, ot_comp_end)
+
+  s_post = discretize_state(Parameters, State)
+
+  Q_AGENT.update(s_pre, int(action), r, s_post, alpha = float(Parameters['rl_alpha']), gamma = float(Parameters['rl_gamma']))
+
+  return float(r)
 
 #Debugging test to make sure Dataframe is produced as intended
 df_test = run_sim(Parameters, State.copy(), rng)
@@ -598,14 +766,14 @@ test5 = test5[['it_comp', 'it_detected', 'it_contained', 'it_comp_post', 'ot_com
 
 #test attack damage and recovery outputs
 test6 = run_sim(Parameters, State.copy(), np.random.default_rng(int(Parameters['Seed'])))
-test6 = test6[['t', 'attack_name', 'ot_comp_end', 'damage_step', 'phys_damage_next', 'downtime_total', 'downtime_next']].head(50)
+test6 = test6[['t', 'attack_name', 'ot_comp_end', 'damage_step', 'phys_damage_next', 'downtime_step', 'downtime_next']].head(50)
 
 #test defender action choice logic implementation, threshold_v1
 Parameters['defender_policy'] = 'threshold_v1'
 State['id_cap'] = 0.35
 test_policy1 = run_sim(Parameters, State.copy(), np.random.default_rng(int(Parameters['Seed'])))
 
-display(test_policy1[["t","action_name","attack_name","it_comp","ot_comp","it_comp_post_dc","ot_comp_post_dc","it_comp_end","ot_comp_end"]].head(50))
+print(test_policy1.head(50))
 print(test_policy1["action_name"].value_counts())
 
 test6
