@@ -90,7 +90,7 @@ Parameters = pd.Series({
     #Damage and downtime dynamics (placeholders until we tune parameter values)
     'base_damage' : 0.02, #per timestep damage done to defender while OT is compromised
     'high_damage_multiplier' : 3.0, #multiplication factor for when attacks are high intensity
-    'damage_persistence': 1.0, #1.0 means no decay, if we decrease below 1.0 systems damage will decay over time
+    'damage_persistence': 0.95, #1.0 means no decay, if we decrease below 1.0 systems damage will decay over time
 
     'downtime_comp_cost': 0.05, #cost of downtime increases the longer a system remains compromised
     'downtime_damage_cost' : 0.02, #additional downtime increases per step unit damage
@@ -98,7 +98,7 @@ Parameters = pd.Series({
 
     #Recovery probabilities
     'p_recover_clear_base' : 0.10, #chance recovery clears compromise status
-    'damage_recover_decay' : 0.02 #fraction of damage removed under RECOVER action
+    'damage_recover_decay' : 0.05 #fraction of damage removed under RECOVER action
 })
 
 #Reproducible randomness
@@ -170,7 +170,7 @@ def sim_step(Parameters, State, rng, t, rows):
   policy = Parameters.get('defender_policy', 'always_passive')
   s_pre = discretize_state(Parameters, State) if policy == 'qlearn_v1' else None
 
-  #Placeholder policy: always PASSIVE for now (1/6/26)
+  #defender action decision
   action = choose_action(Parameters, State, rng, t)
 
   #Defender action effects
@@ -197,6 +197,9 @@ def sim_step(Parameters, State, rng, t, rows):
 
   #recovery action step (if recovery action is chosen)
   recovery = recovery_resolution_step(Parameters, State, rng, B, action)
+
+  #damage recovery over time (helps Qlearner reach more states, can be rationalized as 'normal maintinence operations')
+  State['phys_damage'] = max(0.0, float(State['phys_damage']) * float(Parameters.get('damage_persistence', 1.0)))
 
   #compromise state after recovery step
   it_comp_end = int(State['it_comp'])
@@ -658,8 +661,8 @@ rl_defaults = {
     #reward weights, specifically measured in an actions ability to minimize loss per/step per action (reward = -loss)
     'rl_w_damage_step': 5.0,  # physical damage to infrastructure highly penalizes reward return
     'rl_w_outage': 2.0,       # penalty for interruption to infrastructure services
-    'rl_w_ot_comp': 1.0,      # penalty for OT compromise
-    'rl_w_it_comp': 0.25,     # small IT compromise penalty, since this does not directly influence infrastructure only allows access for further damage
+    'rl_w_ot_comp': 2.0,      # penalty for OT compromise
+    'rl_w_it_comp': 0.5,     # small IT compromise penalty, since this does not directly influence infrastructure only allows access for further damage
     #I realized damage per step is penalized but accumulated damage is not penalized, this needs to be accounted for in reward weighting
     'rl_w_phys_damage': 2.0,  #penalize the infrasturctures accumulated damage stock
 
@@ -739,7 +742,7 @@ class QLearner:
 
 Q_AGENT = QLearner(n_actions = 3)
 
-#enure learning from previous runs is erased for new runs
+#ensure learning from previous runs is erased for new runs
 def reset_qlearner():
   global Q_AGENT
   Q_AGENT = QLearner(n_actions = 3)
@@ -853,6 +856,42 @@ print("Train action mix by window (head):")
 print(train_action_mix.head())
 print("Eval action mix (qlearn greedy) by window (head):")
 print(eval_action_mix_q.head())
+
+train_df = run_one(Parameters, seed=1, policy='qlearn_v1', T=100000, learn=1, epsilon=float(Parameters['rl_epsilon']))
+
+#evaluate qlearning effectiveness under high vs low threat (different than attack intensity, basically just hard coding a probability of an attack occuring to examine 'high' and 'low' attack threat conditions)
+def eval_high_vs_low_threat(P, q_agent, p_attack, seed=123, T=25000):
+    P2 = P.copy()
+    P2['defender_policy'] = 'qlearn_v1'
+    P2['rl_learn'] = 0
+    P2['rl_epsilon'] = 0.0
+    P2['p_attack'] = p_attack
+    P2['Seed'] = seed
+    rng = np.random.default_rng(int(P2['Seed']))
+    df = run_sim(P2, make_initial_state(P2), rng)
+    return summarize_run(df), df['action_name'].value_counts(normalize=True).to_dict()
+
+low_sum, low_mix = eval_high_vs_low_threat(Parameters, Q_AGENT, p_attack=0.10)
+high_sum, high_mix = eval_high_vs_low_threat(Parameters, Q_AGENT, p_attack=0.60)
+
+print("LOW THREAT:", low_sum, low_mix)
+print("HIGH THREAT:", high_sum, high_mix)
+
+
+#compare threshold and random policy performance to qlearning performance in high and low threat conditions
+def eval_policy_under(P, policy, p_attack, seed=123, T=25000):
+    P2 = P.copy()
+    P2['defender_policy'] = policy
+    P2['p_attack'] = p_attack
+    P2['Seed'] = seed
+    rng = np.random.default_rng(int(P2['Seed']))
+    df = run_sim(P2, make_initial_state(P2), rng)
+    return summarize_run(df)
+
+print("THRESH low :", eval_policy_under(Parameters, "threshold_v1", 0.10))
+print("THRESH high:", eval_policy_under(Parameters, "threshold_v1", 0.60))
+print("RAND low   :", eval_policy_under(Parameters, "random", 0.10))
+print("RAND high  :", eval_policy_under(Parameters, "random", 0.60))
 
 #Debugging test to make sure Dataframe is produced as intended
 df_test = run_sim(Parameters, State.copy(), rng)
