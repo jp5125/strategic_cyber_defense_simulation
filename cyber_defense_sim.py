@@ -645,7 +645,7 @@ rl_defaults = {
     #hyperparameters for agent learning, adjustable during parameter sweeps
     'rl_alpha': 0.15,
     'rl_gamma': 0.95,
-    'rl_epsilon': 0.10,
+    'rl_epsilon': 0.20,
 
     #discretization values, this step allows for us to use the tabular q-learning technique with continuous data
     'rl_id_cap_lo' : 0.33,
@@ -660,6 +660,8 @@ rl_defaults = {
     'rl_w_outage': 2.0,       # penalty for interruption to infrastructure services
     'rl_w_ot_comp': 1.0,      # penalty for OT compromise
     'rl_w_it_comp': 0.25,     # small IT compromise penalty, since this does not directly influence infrastructure only allows access for further damage
+    #I realized damage per step is penalized but accumulated damage is not penalized, this needs to be accounted for in reward weighting
+    'rl_w_phys_damage': 2.0,  #penalize the infrasturctures accumulated damage stock
 
     'rl_learn' : 1,     # 1 = training mode, 0 = evaluation mode (stops updating)
 
@@ -744,12 +746,13 @@ def reset_qlearner():
 
 
 # reward calculation, in terms of minimizing loss, for the QAgent
-def rl_step_reward(Parameters, damage_step, outage_next, it_comp_end, ot_comp_end, action):
+def rl_step_reward(Parameters, damage_step, phys_damage_next, outage_next, it_comp_end, ot_comp_end, action):
   loss = 0.0
   loss += float(Parameters['rl_w_damage_step']) * float(damage_step)
   loss += float(Parameters['rl_w_outage']) * float(outage_next)
   loss += float(Parameters['rl_w_it_comp']) * float(it_comp_end)
   loss += float(Parameters['rl_w_ot_comp']) * float(ot_comp_end)
+  loss += float(Parameters['rl_w_phys_damage']) * float(phys_damage_next) #account for accumulated damage in the reward calculation
 
   #reduce reward for step by action cost parameter
   cost = 0.0
@@ -763,7 +766,8 @@ def rl_step_reward(Parameters, damage_step, outage_next, it_comp_end, ot_comp_en
 #
 def qlearn_update_step(Parameters, State, Q_AGENT, s_pre, action, damage_step, it_comp_end, ot_comp_end):
   outage_next = float(State.get('outage', 0.0))
-  r = rl_step_reward(Parameters, damage_step, outage_next, it_comp_end, ot_comp_end, action)
+  phys_damage_next = float(State.get('phys_damage', 0.0))
+  r = rl_step_reward(Parameters, damage_step, phys_damage_next, outage_next, it_comp_end, ot_comp_end, action)
 
   s_post = discretize_state(Parameters, State)
 
@@ -818,15 +822,15 @@ Parameters['T'] = 20000
 
 # training stage (p(sigma) = explore, 1 - p(sigma) = exploit)
 reset_qlearner()
-train_df = run_one(Parameters, seed=1, policy='qlearn_v1', T=20000, learn=1, epsilon=float(Parameters['rl_epsilon']))
+train_df = run_one(Parameters, seed=1, policy='qlearn_v1', T=100000, learn=1, epsilon=float(Parameters['rl_epsilon']))
 
 # evaluation of qlearn policy after training (greedy, no learning)
-eval_q_df = run_one(Parameters, seed=2, policy='qlearn_v1', T=5000, learn=0, epsilon=0.0)
+eval_q_df = run_one(Parameters, seed=2, policy='qlearn_v1', T=25000, learn=0, epsilon=0.0)
 
 # herustic policy runs for comparison to qlearning policy
-eval_thr_df = run_one(Parameters, seed=2, policy='threshold_v1', T=5000)
-eval_pas_df = run_one(Parameters, seed=2, policy='always_passive', T=5000)
-eval_rnd_df = run_one(Parameters, seed=2, policy='random', T=5000)
+eval_thr_df = run_one(Parameters, seed=2, policy='threshold_v1', T=25000)
+eval_pas_df = run_one(Parameters, seed=2, policy='always_passive', T=25000)
+eval_rnd_df = run_one(Parameters, seed=2, policy='random', T=25000)
 
 train_summary = summarize_run(df = train_df)
 eval_summary = {
