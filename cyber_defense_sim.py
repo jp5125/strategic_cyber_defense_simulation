@@ -53,6 +53,7 @@ Parameters = pd.Series({
     'ot_comp_init' : 0,
     'downtime_init' : 0.0,
     'phys_damage_init' : 0.0,
+    'outage_init': 0.0,
 
     #Attacker event process
     'p_attack': 0.35,
@@ -108,7 +109,8 @@ print(Parameters)
 #Simulation State Code
 
 #Initialize state as a Pandas series
-State = pd.Series({
+def make_initial_state(Parameters):
+  return pd.Series({
     'it_vuln' : clip01(Parameters['it_vuln_init']),
     'ot_vuln' : clip01(Parameters['ot_vuln_init']),
     'id_cap' : clip01(Parameters['id_cap_init']),
@@ -118,8 +120,10 @@ State = pd.Series({
     "ot_comp" : int(Parameters['ot_comp_init']),
     "downtime" : float(Parameters['downtime_init']),
     "phys_damage" : float(Parameters['phys_damage_init']),
-    "outage" : 0.0
+    "outage" : float(Parameters['outage_init']),
     })
+
+State = make_initial_state(Parameters)
 
 #Simulation time + log storage data structures
 t = 0
@@ -254,7 +258,8 @@ def sim_step(Parameters, State, rng, t, rows):
      'outage_next': outage_end,
 
      #rl values
-     'rl_reward' : rl_reward
+     'rl_reward' : rl_reward,
+     'q_size': len(Q_AGENT.Q) if policy == 'qlearn_v1' else np.nan
 
     })
 
@@ -565,7 +570,7 @@ some kind of RL algorithm which will be inplemnted later to help optimize defens
 #First, we need to define thresholds for defender decisions regarding which action to take in a timestep
 policy_defaults = {
     'defender_policy': 'threshold_v1',  # options currently implemented: 'always_passive', 'threshold_v1', 'random', 'qlearn_v1'
-    'id_cap_min_threshold': 0.30,      # if id_cap is below this, favor PASSIVE
+    'id_cap_min_threshold': 0.30,      # if id_cap is below this, favor ACTIVE
     'phys_damage_threshold': 0.50,     # if damage is above this, favor RECOVER
     'outage_high_threshold': 0.60    # if downtime is above this, favor RECOVER
 }
@@ -655,6 +660,12 @@ rl_defaults = {
     'rl_w_outage': 2.0,       # penalty for interruption to infrastructure services
     'rl_w_ot_comp': 1.0,      # penalty for OT compromise
     'rl_w_it_comp': 0.25,     # small IT compromise penalty, since this does not directly influence infrastructure only allows access for further damage
+
+    'rl_learn' : 1,     # 1 = training mode, 0 = evaluation mode (stops updating)
+
+    #added small costs to certain action because I found under certain parameter values the agent would continuously recover
+    'rl_cost_active': 0.05,
+    'rl_cost_recover': 0.10,
 }
 
 for k,v in rl_defaults.items():
@@ -695,83 +706,178 @@ class QLearner:
   """
   def __init__(self, n_actions = 3):
     self.n_actions = n_actions
-    self.Q = {}
+    self.Q = {} #array that tracks the defender states for the Q-table
 
+  #if a one of the 108 state tuples isnt in the q-table yet, create a new row for that particular permutation of state variable values and add an array of 0s into the row
   def row(self, s):
     if s not in self.Q:
       self.Q[s] = np.zeros(self.n_actions, dtype = float)
     return self.Q[s]
 
+  #needed to add this since all states are not being touched during training, thus when select_action calls row(), it creates additional states-value pairs during evaluation
+  def qvals(self,s):
+    return self.Q.get(s, np.zeros(self.n_actions, dtype = float))
+
+  #function to choose whether agent will either explore by randomly selecting a strategy with p = epsilon, or exploit the current best action choice with p = 1 - epsilon
   def select_action(self, s, epsilon, rng):
     if rng.random() < epsilon:
       return int(rng.integers(0, self.n_actions))
 
-    q = self.row(s)
+    q = self.qvals(s)
     best_actions = np.flatnonzero(q == q.max())
     return int(rng.choice(best_actions))
 
+  #update the q-value of action under specific state tuple, essentially the Bellman equation
   def update(self, s, a, r, s_next, alpha, gamma):
     q = self.row(s)
     q_next = self.row(s_next)
-    td_target = float(r) + float(gamma) * float(np.max(q_next))
+    td_target = float(r) + float(gamma) * float(np.max(q_next)) # td_target = reward value at the current step plus discounted reward value at next step
     q[a] = q[a] + float(alpha) * (td_target - q[a])
 
 
 Q_AGENT = QLearner(n_actions = 3)
 
+#enure learning from previous runs is erased for new runs
 def reset_qlearner():
   global Q_AGENT
   Q_AGENT = QLearner(n_actions = 3)
 
 
-
-def rl_step_reward(Parameters, damage_step, outage_next, it_comp_end, ot_comp_end):
+# reward calculation, in terms of minimizing loss, for the QAgent
+def rl_step_reward(Parameters, damage_step, outage_next, it_comp_end, ot_comp_end, action):
   loss = 0.0
   loss += float(Parameters['rl_w_damage_step']) * float(damage_step)
   loss += float(Parameters['rl_w_outage']) * float(outage_next)
   loss += float(Parameters['rl_w_it_comp']) * float(it_comp_end)
   loss += float(Parameters['rl_w_ot_comp']) * float(ot_comp_end)
 
-  return -float(loss)
+  #reduce reward for step by action cost parameter
+  cost = 0.0
+  if action == Action.ACTIVE:
+    cost += float(Parameters.get('rl_cost_active', 0.0))
+  if action == Action.RECOVER:
+    cost += float(Parameters.get('rl_cost_recover', 0.0))
 
+  return -(float(loss) + float(cost))
+
+#
 def qlearn_update_step(Parameters, State, Q_AGENT, s_pre, action, damage_step, it_comp_end, ot_comp_end):
   outage_next = float(State.get('outage', 0.0))
-  r = rl_step_reward(Parameters, damage_step, outage_next, it_comp_end, ot_comp_end)
+  r = rl_step_reward(Parameters, damage_step, outage_next, it_comp_end, ot_comp_end, action)
 
   s_post = discretize_state(Parameters, State)
 
-  Q_AGENT.update(s_pre, int(action), r, s_post, alpha = float(Parameters['rl_alpha']), gamma = float(Parameters['rl_gamma']))
+  #ensure learning only occurs during training runs
+  if int(Parameters.get('rl_learn', 1)) == 1:
+    Q_AGENT.update(s_pre, int(action), r, s_post, alpha = float(Parameters['rl_alpha']), gamma = float(Parameters['rl_gamma']))
 
   return float(r)
+
+def run_one(Parameters, seed, policy, T, learn=None, epsilon=None):
+  P = Parameters.copy()
+  P['Seed'] = int(seed)
+  P['T'] = int(T)
+  P['defender_policy'] = policy
+  if learn is not None:
+    P['rl_learn'] = int(learn)
+  if epsilon is not None:
+    P['rl_epsilon'] = float(epsilon)
+
+  local_rng = np.random.default_rng(int(P['Seed']))
+  S0 = make_initial_state(P)
+  return run_sim(P, S0, local_rng)
+
+def summarize_run(df):
+  # general summaries
+  out = {}
+  out['mean_reward'] = float(df['rl_reward'].mean()) if 'rl_reward' in df.columns else np.nan
+  out['mean_outage'] = float(df['outage_next'].mean())
+  out['mean_damage_step'] = float(df['damage_step'].mean())
+  out['time_it_comp'] = float(df['it_comp_end'].mean())
+  out['time_ot_comp'] = float(df['ot_comp_end'].mean())
+  out['action_freq'] = (df['action_name'].value_counts(normalize=True)).to_dict()
+  out['q_size_end'] = float(df['q_size'].iloc[-1]) if 'q_size' in df.columns and not df['q_size'].isna().all() else np.nan
+  return out
+
+def rolling_action_freq(df, window=500):
+  # log for frequency of actions over time
+  a = df['action_name']
+  idx = np.arange(len(df))
+  buckets = (idx // window)
+  return (df.assign(bucket=buckets)
+            .groupby(['bucket','action_name'])
+            .size()
+            .groupby(level=0)
+            .apply(lambda s: (s / s.sum()))
+            .unstack(fill_value=0.0))
+
+
+# test to ensure learning is working, compare to other heuristic policies previously implemented
+
+Parameters['T'] = 20000
+
+# training stage (p(sigma) = explore, 1 - p(sigma) = exploit)
+reset_qlearner()
+train_df = run_one(Parameters, seed=1, policy='qlearn_v1', T=20000, learn=1, epsilon=float(Parameters['rl_epsilon']))
+
+# evaluation of qlearn policy after training (greedy, no learning)
+eval_q_df = run_one(Parameters, seed=2, policy='qlearn_v1', T=5000, learn=0, epsilon=0.0)
+
+# herustic policy runs for comparison to qlearning policy
+eval_thr_df = run_one(Parameters, seed=2, policy='threshold_v1', T=5000)
+eval_pas_df = run_one(Parameters, seed=2, policy='always_passive', T=5000)
+eval_rnd_df = run_one(Parameters, seed=2, policy='random', T=5000)
+
+train_summary = summarize_run(df = train_df)
+eval_summary = {
+  'qlearn_greedy': summarize_run(eval_q_df),
+  'threshold_v1': summarize_run(eval_thr_df),
+  'always_passive': summarize_run(eval_pas_df),
+  'random': summarize_run(eval_rnd_df),
+}
+
+print("TRAIN SUMMARY:", train_summary)
+print("EVAL SUMMARY:", eval_summary)
+
+# Learning diagnostics for logging
+train_df['reward_roll'] = train_df['rl_reward'].rolling(500).mean()
+train_action_mix = rolling_action_freq(train_df, window=500)
+eval_action_mix_q = rolling_action_freq(eval_q_df, window=250)
+
+print("Q size end (train):", train_summary['q_size_end'])
+print("Train action mix by window (head):")
+print(train_action_mix.head())
+print("Eval action mix (qlearn greedy) by window (head):")
+print(eval_action_mix_q.head())
 
 #Debugging test to make sure Dataframe is produced as intended
 df_test = run_sim(Parameters, State.copy(), rng)
 df_test.head(10)
 
 #Test of updated functionality, action == pasive should slowly reduce vulnerability and increase id_capability over time (1/6/26)
-test2 = run_sim(Parameters, State.copy(), rng)
+test2 = run_sim(Parameters, make_initial_state(Parameters), rng)
 test2[['t', 'it_vuln', 'it_vuln_next', 'ot_vuln', 'ot_vuln_next', 'id_cap', 'id_cap_next']].head(10)
 
 #Test of attacker functionality implemented on (1/15/26)
-test3 = run_sim(Parameters, State.copy(), np.random.default_rng(int(Parameters["Seed"])))
+test3 = run_sim(Parameters, make_initial_state(Parameters), rng)
 test3[['t', 'id_cap', 'attack_name', 'intensity_name', 'p_high']].head(100)
 
 #Test of attack resolution functionality implemented on (1/16/26)
-test4 = run_sim(Parameters, State.copy(), np.random.default_rng(int(Parameters["Seed"])))
+test4 = run_sim(Parameters, make_initial_state(Parameters), rng)
 test4[['t', 'attack_name', 'intensity_name', 'p_success', 'attack_success', 'it_comp_end', 'ot_comp_end']].head(30)
 
 #test attack resolution outputs
-test5 = run_sim(Parameters, State.copy(), np.random.default_rng(int(Parameters["Seed"])))
+test5 = run_sim(Parameters, make_initial_state(Parameters), rng)
 test5 = test5[['it_comp', 'it_detected', 'it_contained', 'it_comp_post', 'ot_comp', "ot_detected", 'ot_contained', 'ot_comp_post']].head(30)
 
 #test attack damage and recovery outputs
-test6 = run_sim(Parameters, State.copy(), np.random.default_rng(int(Parameters['Seed'])))
+test6 = run_sim(Parameters, make_initial_state(Parameters), rng)
 test6 = test6[['t', 'attack_name', 'ot_comp_end', 'damage_step', 'phys_damage_next', 'downtime_step', 'downtime_next']].head(50)
 
 #test defender action choice logic implementation, threshold_v1
 Parameters['defender_policy'] = 'threshold_v1'
 State['id_cap'] = 0.35
-test_policy1 = run_sim(Parameters, State.copy(), np.random.default_rng(int(Parameters['Seed'])))
+test_policy1 = run_sim(Parameters, make_initial_state(Parameters), rng)
 
 print(test_policy1.head(50))
 print(test_policy1["action_name"].value_counts())
